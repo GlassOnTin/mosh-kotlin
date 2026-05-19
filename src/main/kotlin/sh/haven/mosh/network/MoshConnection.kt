@@ -8,10 +8,6 @@ import sh.haven.mosh.crypto.MoshCrypto.Companion.putBE64
 import sh.haven.mosh.proto.Transportinstruction.Instruction as TransportInstruction
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.SocketTimeoutException
 import java.util.zip.Deflater
 import java.util.zip.Inflater
 
@@ -30,17 +26,17 @@ class MoshConnection(
     serverIp: String,
     port: Int,
     private val crypto: MoshCrypto,
+    private val socketProvider: UdpSocketProvider = UdpSocketProvider { AndroidUdpAdapter() },
 ) : Closeable {
 
-    private val serverAddr = InetAddress.getByName(serverIp)
+    private val serverHost: String = serverIp
     private val serverPort = port
-    // Use unconnected socket to avoid Android propagating ICMP errors as exceptions.
     // @Volatile so the receive loop sees a rebind performed on another thread
     // without needing its own synchronization, and the rebind itself is
     // serialized under socketLock so a concurrent send never observes a
     // half-closed / half-created socket.
     @Volatile
-    private var socket = DatagramSocket()
+    private var socket: UdpSocketAdapter = socketProvider.create()
     private val socketLock = Any()
 
     private var sendNonceSeq = 0L
@@ -52,9 +48,9 @@ class MoshConnection(
     // Reuse buffers for zlib work
     private val deflateBuf = ByteArray(1024)
     private val inflateBuf = ByteArray(4096)
-    // Reuse receive buffer
+    // Reuse receive buffer; the adapter fills it from offset 0 each call
+    // and reports the actual datagram length via UdpReceivedPacket.length.
     private val recvBuf = ByteArray(RECV_BUF_SIZE)
-    private val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
 
     // Timestamp tracking for RTT estimation
     @Volatile var lastReceivedTimestamp: Int = 0
@@ -116,7 +112,7 @@ class MoshConnection(
         // rebind path has just closed. The lock is uncontended under normal
         // operation (sends run back to back on one thread; rebinds are rare).
         synchronized(socketLock) {
-            socket.send(DatagramPacket(packet, packet.size, serverAddr, serverPort))
+            socket.send(packet, serverHost, serverPort)
         }
     }
 
@@ -125,17 +121,10 @@ class MoshConnection(
      * @return the instruction, or null on timeout
      */
     fun receiveInstruction(timeoutMs: Int): TransportInstruction? {
-        socket.soTimeout = timeoutMs
-
         while (true) {
-            recvPacket.length = recvBuf.size
-            try {
-                socket.receive(recvPacket)
-            } catch (_: SocketTimeoutException) {
-                return null
-            }
+            val received = socket.receive(recvBuf, timeoutMs) ?: return null
 
-            val packet = recvBuf.copyOf(recvPacket.length)
+            val packet = recvBuf.copyOf(received.length)
 
             val (nonceVal, plaintext) = try {
                 crypto.decrypt(packet)
@@ -207,16 +196,18 @@ class MoshConnection(
     /**
      * Recreate the UDP socket to recover from network changes (IP roaming).
      * The old socket may be bound to a defunct interface; a fresh socket
-     * binds to the current default route.
+     * from the same [socketProvider] inherits the same transport choice
+     * (raw UDP for direct sessions, tunneled UDP for tunneled sessions —
+     * see #164).
      *
      * Called from the send loop. The receive loop is normally blocked in
-     * `socket.receive()` on the old socket; closing it makes that call throw
-     * (typically `SocketException("Socket closed")`, which surfaces through
-     * the JNI layer as `recvfrom failed: EBADF`). The receive loop catches
-     * the exception, continues, and re-reads `this.socket` on the next
-     * iteration — which, because the field is @Volatile and the close →
-     * replace is serialized under [socketLock], is guaranteed to be the
-     * new socket.
+     * `socket.receive()` on the old socket; closing it makes that call
+     * throw (e.g. `SocketException("Socket closed")` for AndroidUdpAdapter,
+     * or an `IOException` from the bridge layer for tunneled adapters).
+     * The receive loop catches the exception, continues, and re-reads
+     * `this.socket` on the next iteration — which, because the field is
+     * @Volatile and the close → replace is serialized under [socketLock],
+     * is guaranteed to be the new socket.
      *
      * Concurrent sends during the swap are held on [socketLock] so a send
      * never fires a packet into a socket the receive thread has just
@@ -225,7 +216,7 @@ class MoshConnection(
     fun rebindSocket() {
         synchronized(socketLock) {
             try { socket.close() } catch (_: Exception) {}
-            socket = DatagramSocket()
+            socket = socketProvider.create()
         }
     }
 

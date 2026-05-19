@@ -40,6 +40,16 @@ class MoshTransport(
     private val logger: MoshLogger = NoOpLogger,
     private val initialCols: Int = 80,
     private val initialRows: Int = 24,
+    /**
+     * Factory for the underlying UDP socket. Defaults to a plain
+     * [java.net.DatagramSocket] via [sh.haven.mosh.network.AndroidUdpAdapter],
+     * matching pre-#164 behaviour. Tunneled callers (Mosh-over-WireGuard
+     * or Mosh-over-Tailscale per #164) pass a provider that yields a
+     * tunneled adapter so packets traverse the tunnel rather than the
+     * device's default route.
+     */
+    private val socketProvider: sh.haven.mosh.network.UdpSocketProvider =
+        sh.haven.mosh.network.UdpSocketProvider { sh.haven.mosh.network.AndroidUdpAdapter() },
 ) : Closeable {
 
     private val crypto = MoshCrypto(key)
@@ -94,7 +104,7 @@ class MoshTransport(
         scope.launch(Dispatchers.IO) {
             if (closed) return@launch
             try {
-                connection = MoshConnection(serverIp, port, crypto)
+                connection = MoshConnection(serverIp, port, crypto, socketProvider)
                 logger.d(TAG, "UDP socket connected to $serverIp:$port")
             } catch (e: Exception) {
                 logger.e(TAG, "Failed to create UDP connection", e)
