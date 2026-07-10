@@ -351,12 +351,30 @@ class MoshTransport(
         const val PROTOCOL_VERSION = 2
         const val SEND_MIN_INTERVAL_MS = 20L
         const val ACK_DELAY_MS = 20L
-        /** Threshold after which the UI sees a non-null countdown — set above
-         *  [KEEPALIVE_INTERVAL_MS] (3s) so a single missed keepalive doesn't
-         *  flicker the indicator on a healthy connection. */
-        const val STALL_DISPLAY_MS = 4_000L
-        const val NETWORK_STALL_MS = 6_000L
-        const val SESSION_DEAD_MS = 8_000L
+        /**
+         * Threshold after which the UI sees a non-null countdown.
+         * Set to 30s so short Wi-Fi flips (10-20s) don't alarm the user.
+         * Original: 4_000L (4s) — flickered on every micro-outage.
+         */
+        const val STALL_DISPLAY_MS = 30_000L
+        /**
+         * Network stall threshold before rebinding the UDP socket for IP roaming.
+         * Increased from 6s to 45s — short Wi-Fi reconnects (phone switches
+         * APs, VPN flap) shouldn't trigger a socket rebind. The OS handles
+         * packet delivery transparently for sub-minute outages.
+         * Original: 6_000L
+         */
+        const val NETWORK_STALL_MS = 45_000L
+        /**
+         * Session-dead threshold before the client gives up and disconnects.
+         * Increased from 8s to 120s (2 minutes). This is the key change:
+         * mosh-server lives 7 days; the client should tolerate long
+         * Wi-Fi/cellular outages (switching towers, changing ISPs) without
+         * killing the session. Two minutes is enough for a clean Wi-Fi→LTE
+         * handover plus a few retries.
+         * Original: 8_000L
+         */
+        const val SESSION_DEAD_MS = 120_000L
         const val KEEPALIVE_INTERVAL_MS = 3000L
         const val RECV_TIMEOUT_MS = 250
     }
