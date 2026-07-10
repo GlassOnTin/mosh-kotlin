@@ -60,6 +60,15 @@ class MoshTransport(
     private val sessionDeadMs: Long? = null,
 ) : Closeable {
 
+    init {
+        sessionDeadMs?.let { ms ->
+            require(ms > NETWORK_STALL_MS) {
+                "sessionDeadMs ($ms) must exceed NETWORK_STALL_MS " +
+                "($NETWORK_STALL_MS) for roaming recovery"
+            }
+        }
+    }
+
     private val crypto = MoshCrypto(key)
     private val userStream = UserStream()
     private val extensionRegistry = ExtensionRegistryLite.newInstance().also {
