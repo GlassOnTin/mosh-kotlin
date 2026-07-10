@@ -50,6 +50,14 @@ class MoshTransport(
      */
     private val socketProvider: sh.haven.mosh.network.UdpSocketProvider =
         sh.haven.mosh.network.UdpSocketProvider { sh.haven.mosh.network.AndroidUdpAdapter() },
+    /**
+     * Override for [SESSION_DEAD_MS]. When non-null, this value (in
+     * milliseconds) replaces the hardcoded session-dead timeout, allowing
+     * per-profile tuning (e.g. 30s for quick recovery, 300s for long
+     * outages). Null = use the hardcoded default.
+     * Set from ConnectionProfile.moshSessionTimeoutSec × 1000.
+     */
+    private val sessionDeadMs: Long? = null,
 ) : Closeable {
 
     private val crypto = MoshCrypto(key)
@@ -84,7 +92,8 @@ class MoshTransport(
     @Volatile private var lastReceiveTimeMs: Long = 0
     @Volatile private var stallRebound = false
 
-    // Countdown surfaced to the UI when the server has gone silent.
+    /** Effective session-dead timeout: per-profile override or hardcoded default. */
+    private val effectiveSessionDeadMs: Long get() = sessionDeadMs ?: SESSION_DEAD_MS
     // null while the connection is healthy or before the first packet arrives;
     // otherwise the seconds remaining before [SESSION_DEAD_MS] fires the close.
     private val _secondsUntilDisconnect = MutableStateFlow<Int?>(null)
@@ -258,14 +267,14 @@ class MoshTransport(
                     // the UI can replace its silent unresponsive window with a
                     // visible "closing in N s" indicator.
                     _secondsUntilDisconnect.value = if (recvAge > STALL_DISPLAY_MS) {
-                        ((SESSION_DEAD_MS - recvAge + 999) / 1000).coerceAtLeast(0L).toInt()
+                        ((effectiveSessionDeadMs - recvAge + 999) / 1000).coerceAtLeast(0L).toInt()
                     } else {
                         null
                     }
                     // Session-dead: mosh-server shuts down ~4s after shell exit
                     // and stops sending packets. Detect this and tear down
                     // instead of retransmitting into the void forever (#92).
-                    if (recvAge > SESSION_DEAD_MS) {
+                    if (recvAge > effectiveSessionDeadMs) {
                         logger.d(TAG, "Server unresponsive for ${recvAge}ms, disconnecting")
                         _secondsUntilDisconnect.value = 0
                         close()
@@ -273,7 +282,7 @@ class MoshTransport(
                         return
                     }
                     // Network stall: rebind socket once for IP roaming recovery
-                    // before giving up at SESSION_DEAD_MS.
+                    // before giving up at effectiveSessionDeadMs.
                     if (recvAge > NETWORK_STALL_MS && !stallRebound) {
                         logger.d(TAG, "No packets for ${recvAge}ms, rebinding socket")
                         connection?.rebindSocket()
