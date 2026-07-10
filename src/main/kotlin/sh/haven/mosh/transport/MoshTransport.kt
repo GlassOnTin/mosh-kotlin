@@ -80,15 +80,19 @@ class MoshTransport(
     @Volatile private var packetsReceived: Long = 0
     @Volatile private var firstOutputReceived: Boolean = false
 
-    // Network roaming / session-dead detection
+    // Network roaming / stall detection
     @Volatile private var lastReceiveTimeMs: Long = 0
-    @Volatile private var stallRebound = false
+    @Volatile private var lastRebindTimeMs: Long = 0
+    @Volatile private var consecutiveSendErrors: Int = 0
 
-    // Countdown surfaced to the UI when the server has gone silent.
-    // null while the connection is healthy or before the first packet arrives;
-    // otherwise the seconds remaining before [SESSION_DEAD_MS] fires the close.
-    private val _secondsUntilDisconnect = MutableStateFlow<Int?>(null)
-    val secondsUntilDisconnect: StateFlow<Int?> = _secondsUntilDisconnect.asStateFlow()
+    // Stall age surfaced to the UI when the server has gone silent.
+    // null while the connection is healthy or before the first packet
+    // arrives; otherwise the seconds since the last server packet. The
+    // transport never gives up on silence alone (mosh semantics — the
+    // session resumes whenever connectivity returns); it ends only on an
+    // announced server shutdown or an explicit [close].
+    private val _stallSeconds = MutableStateFlow<Int?>(null)
+    val stallSeconds: StateFlow<Int?> = _stallSeconds.asStateFlow()
 
     // Conflated channel: wakes the send loop immediately when input arrives
     private val inputNotify = Channel<Unit>(Channel.CONFLATED)
@@ -161,8 +165,7 @@ class MoshTransport(
 
                 if (instruction == null) continue // timeout
                 lastReceiveTimeMs = System.currentTimeMillis()
-                stallRebound = false
-                _secondsUntilDisconnect.value = null
+                _stallSeconds.value = null
                 processInstruction(instruction)
             }
         } catch (_: CancellationException) {
@@ -175,8 +178,24 @@ class MoshTransport(
         }
     }
 
-    private fun processInstruction(inst: TransportInstruction) {
+    internal fun processInstruction(inst: TransportInstruction) {
         packetsReceived++
+
+        // Explicit server shutdown: when the shell exits, mosh-server
+        // announces it by sending a state numbered -1 (uint64 max) —
+        // upstream Transport::start_shutdown(). This replaces the old
+        // silence-based SESSION_DEAD_MS heuristic (#92), which couldn't
+        // tell a dead shell from a dead network and killed live sessions
+        // after 8s offline. We don't ack the shutdown state; the server
+        // stops waiting for the ack after ~3s and exits anyway.
+        if (inst.newNum == SHUTDOWN_STATE_NUM) {
+            if (!closed) {
+                logger.d(TAG, "Server announced shutdown (newNum=-1), closing")
+                close()
+                onDisconnect?.invoke(true)
+            }
+            return
+        }
 
         // Update server's acknowledgement of our state
         if (inst.ackNum > serverAckedOurNum) {
@@ -254,30 +273,30 @@ class MoshTransport(
 
                 val recvAge = now - lastReceiveTimeMs
                 if (lastReceiveTimeMs > 0) {
-                    // Surface a countdown once we cross the stall threshold so
-                    // the UI can replace its silent unresponsive window with a
-                    // visible "closing in N s" indicator.
-                    _secondsUntilDisconnect.value = if (recvAge > STALL_DISPLAY_MS) {
-                        ((SESSION_DEAD_MS - recvAge + 999) / 1000).coerceAtLeast(0L).toInt()
+                    // Surface the stall age once we cross the display
+                    // threshold so the UI can show a "no contact for N s"
+                    // indicator. There is no client-side give-up: shell
+                    // exit is announced explicitly by the server (see
+                    // SHUTDOWN_STATE_NUM), so silence only ever means the
+                    // network is away — keep retrying until it returns,
+                    // like upstream mosh.
+                    _stallSeconds.value = if (recvAge > STALL_DISPLAY_MS) {
+                        (recvAge / 1000).toInt()
                     } else {
                         null
                     }
-                    // Session-dead: mosh-server shuts down ~4s after shell exit
-                    // and stops sending packets. Detect this and tear down
-                    // instead of retransmitting into the void forever (#92).
-                    if (recvAge > SESSION_DEAD_MS) {
-                        logger.d(TAG, "Server unresponsive for ${recvAge}ms, disconnecting")
-                        _secondsUntilDisconnect.value = 0
-                        close()
-                        onDisconnect?.invoke(true)
-                        return
-                    }
-                    // Network stall: rebind socket once for IP roaming recovery
-                    // before giving up at SESSION_DEAD_MS.
-                    if (recvAge > NETWORK_STALL_MS && !stallRebound) {
+                    // Network stall: rebind the socket periodically for IP
+                    // roaming recovery. After an interface change (Wi-Fi →
+                    // LTE) the old socket may sit on a dead network; a
+                    // one-shot rebind can itself land while the network is
+                    // still down, so repeat every NETWORK_STALL_MS of
+                    // continued silence until packets flow again.
+                    if (recvAge > NETWORK_STALL_MS &&
+                        now - lastRebindTimeMs >= NETWORK_STALL_MS
+                    ) {
                         logger.d(TAG, "No packets for ${recvAge}ms, rebinding socket")
                         connection?.rebindSocket()
-                        stallRebound = true
+                        lastRebindTimeMs = now
                     }
                 }
 
@@ -342,8 +361,15 @@ class MoshTransport(
                 retransmitCount = 0
             }
             lastSentNewNum = currentNum
+            consecutiveSendErrors = 0
         } catch (e: Exception) {
-            if (!closed) logger.e(TAG, "Send error", e)
+            // While the network is away every keepalive/retransmit throws;
+            // log the first failure and then sample, or an hour offline
+            // floods logcat and the verbose buffer.
+            consecutiveSendErrors++
+            if (!closed && (consecutiveSendErrors == 1 || consecutiveSendErrors % 20 == 0)) {
+                logger.e(TAG, "Send error (x$consecutiveSendErrors)", e)
+            }
         }
     }
 
@@ -351,12 +377,19 @@ class MoshTransport(
         const val PROTOCOL_VERSION = 2
         const val SEND_MIN_INTERVAL_MS = 20L
         const val ACK_DELAY_MS = 20L
-        /** Threshold after which the UI sees a non-null countdown — set above
-         *  [KEEPALIVE_INTERVAL_MS] (3s) so a single missed keepalive doesn't
-         *  flicker the indicator on a healthy connection. */
-        const val STALL_DISPLAY_MS = 4_000L
+        /** Threshold after which the UI sees a non-null stall age — set to
+         *  cover two missed keepalives ([KEEPALIVE_INTERVAL_MS] 3s) plus
+         *  jitter so a single lost packet doesn't flicker the indicator on
+         *  a healthy connection. */
+        const val STALL_DISPLAY_MS = 8_000L
+        /** Cadence of socket rebinds during a stall (IP roaming recovery). */
         const val NETWORK_STALL_MS = 6_000L
-        const val SESSION_DEAD_MS = 8_000L
+        /**
+         * State number mosh-server sends to announce shutdown after the
+         * shell exits (uint64 max, i.e. -1). Upstream mosh
+         * Transport::start_shutdown().
+         */
+        const val SHUTDOWN_STATE_NUM = -1L
         const val KEEPALIVE_INTERVAL_MS = 3000L
         const val RECV_TIMEOUT_MS = 250
     }
