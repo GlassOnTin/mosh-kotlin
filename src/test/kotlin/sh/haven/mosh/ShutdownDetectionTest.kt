@@ -85,4 +85,28 @@ class ShutdownDetectionTest {
         assertNull(t.stallSeconds.value)
         t.close()
     }
+
+    /**
+     * #421: the stall banner ("No server contact — retrying") is driven by
+     * [MoshTransport.stallSeconds], which is only refreshed inside the send
+     * loop. When the transport is closed (server shutdown or fatal error)
+     * that loop stops, so a non-null value would stick on screen and read as
+     * a reconnect that never happens. close() must clear it. Force a stall
+     * value via reflection first so this fails if the clear is removed.
+     */
+    @Test
+    fun `close clears a live stall countdown`() {
+        val recorder = DisconnectRecorder()
+        val t = transport(recorder)
+
+        val field = MoshTransport::class.java.getDeclaredField("_stallSeconds")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        (field.get(t) as kotlinx.coroutines.flow.MutableStateFlow<Int?>).value = 42
+        assertEquals(42, t.stallSeconds.value)
+
+        t.close()
+
+        assertNull(t.stallSeconds.value)
+    }
 }

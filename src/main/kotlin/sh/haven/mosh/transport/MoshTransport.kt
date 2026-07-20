@@ -148,6 +148,13 @@ class MoshTransport(
         receiveJob?.cancel()
         sendJob?.cancel()
         try { connection?.close() } catch (_: Exception) {}
+        // Clear the stall countdown so the "No server contact — retrying"
+        // banner can't stay frozen on screen after the transport is gone.
+        // The value is only refreshed inside the (now-cancelled) send loop,
+        // so without this it sticks at its last reading and reads as a
+        // reconnect that never happens (#421). A genuinely stalling — but
+        // still live — transport keeps updating it and still shows the banner.
+        _stallSeconds.value = null
     }
 
     private suspend fun receiveLoop() {
@@ -174,6 +181,10 @@ class MoshTransport(
             if (!closed) {
                 logger.e(TAG, "Receive loop failed", e)
                 onDisconnect?.invoke(false)
+                // A fatal receive error means the transport is dead — stop the
+                // send loop (which would otherwise keep retransmitting as a
+                // zombie) and clear the stall banner (#421).
+                close()
             }
         }
     }
