@@ -200,14 +200,26 @@ class MoshConnection(
      * (raw UDP for direct sessions, tunneled UDP for tunneled sessions —
      * see #164).
      *
-     * Called from the send loop. The receive loop is normally blocked in
-     * `socket.receive()` on the old socket; closing it makes that call
-     * throw (e.g. `SocketException("Socket closed")` for AndroidUdpAdapter,
-     * or an `IOException` from the bridge layer for tunneled adapters).
-     * The receive loop catches the exception, continues, and re-reads
-     * `this.socket` on the next iteration — which, because the field is
-     * @Volatile and the close → replace is serialized under [socketLock],
-     * is guaranteed to be the new socket.
+     * Called from the send loop. Create the replacement FIRST, then swap, then
+     * close the old one. The receive loop is normally blocked in
+     * `socket.receive()` on the old socket; closing it makes that call throw
+     * (e.g. `SocketException("Socket closed")` for AndroidUdpAdapter, or an
+     * `IOException` from the bridge layer for tunneled adapters). The receive
+     * loop catches the exception, continues, and re-reads `this.socket` on the
+     * next iteration — which, because the field is @Volatile and the swap is
+     * serialized under [socketLock], is the new socket.
+     *
+     * If `create()` throws — the tunnel is still flapping, or the interface
+     * change isn't complete mid-roam ([sh.haven.mosh.network.UdpSocketProvider]
+     * for a tunneled session raises `IOException` here) — keep the current
+     * socket instead of installing a closed one, and never let the exception
+     * escape: the old code closed-then-created, so a throwing create left the
+     * field pointing at a closed socket and unwound into the send loop, killing
+     * it. The receive loop then hot-spun on the closed socket ("Socket is
+     * closed") and the session was stranded one-way-dead with no reconnect
+     * (#421). Swallowing the failure here means the next stall cycle retries;
+     * when connectivity returns, create() succeeds and the swap recovers the
+     * session.
      *
      * Concurrent sends during the swap are held on [socketLock] so a send
      * never fires a packet into a socket the receive thread has just
@@ -215,8 +227,14 @@ class MoshConnection(
      */
     fun rebindSocket() {
         synchronized(socketLock) {
-            try { socket.close() } catch (_: Exception) {}
-            socket = socketProvider.create()
+            val fresh = try {
+                socketProvider.create()
+            } catch (_: Exception) {
+                return
+            }
+            val old = socket
+            socket = fresh
+            try { old.close() } catch (_: Exception) {}
         }
     }
 

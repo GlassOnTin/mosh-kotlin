@@ -167,6 +167,13 @@ class MoshTransport(
                     throw CancellationException()
                 } catch (e: Exception) {
                     if (!closed) logger.e(TAG, "Receive error: ${e.message}")
+                    // Back off before retrying. receiveInstruction returns null
+                    // on a normal timeout, so reaching here means a real socket
+                    // error; without a pause a persistently-bad socket becomes a
+                    // CPU/log hot-loop (the "Socket is closed" flood in #421),
+                    // and delay() is also the loop's only suspension point, so it
+                    // is what lets cooperative cancellation actually take effect.
+                    delay(RECV_TIMEOUT_MS.toLong())
                     continue
                 }
 
