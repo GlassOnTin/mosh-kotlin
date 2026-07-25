@@ -50,6 +50,17 @@ class MoshTransport(
      */
     private val socketProvider: sh.haven.mosh.network.UdpSocketProvider =
         sh.haven.mosh.network.UdpSocketProvider { sh.haven.mosh.network.AndroidUdpAdapter() },
+    /**
+     * Whether the device currently has a usable network. This is what lets the
+     * transport tell "we are offline, keep waiting" (mosh's whole point — resume
+     * after a tunnel, a pocket, a doze) apart from "we are online but this
+     * session is never coming back", which is the only case [declareDead] acts
+     * on. #92 removed an earlier silence-only death heuristic because it killed
+     * live sessions after 8s offline; gating on connectivity is what stops this
+     * from reintroducing that. Defaults to "assume online" so a host that does
+     * not wire it still gets the #421 escape hatch.
+     */
+    private val networkAvailable: () -> Boolean = { true },
 ) : Closeable {
 
     private val crypto = MoshCrypto(key)
@@ -83,6 +94,14 @@ class MoshTransport(
     // Network roaming / stall detection
     @Volatile private var lastReceiveTimeMs: Long = 0
     @Volatile private var lastRebindTimeMs: Long = 0
+
+    /**
+     * Socket rebinds attempted since the last packet arrived — reset by any
+     * receive. Requiring several before [DEAD_SESSION_MS] can fire means a
+     * session is only declared dead after repeated recovery attempts have all
+     * gone unanswered, not merely because one rebind landed badly.
+     */
+    @Volatile private var rebindsSinceReceive: Int = 0
     @Volatile private var consecutiveSendErrors: Int = 0
 
     // Stall age surfaced to the UI when the server has gone silent.
@@ -179,6 +198,7 @@ class MoshTransport(
 
                 if (instruction == null) continue // timeout
                 lastReceiveTimeMs = System.currentTimeMillis()
+                rebindsSinceReceive = 0 // contact restored — start the #421 count over
                 _stallSeconds.value = null
                 processInstruction(instruction)
             }
@@ -315,6 +335,29 @@ class MoshTransport(
                         logger.d(TAG, "No packets for ${recvAge}ms, rebinding socket")
                         connection?.rebindSocket()
                         lastRebindTimeMs = now
+                        rebindsSinceReceive++
+                    }
+                    // Escalation (#421): rebinding recovers a *roamed* session,
+                    // but not one the server side no longer has — and then we
+                    // retransmit into the void forever behind a "retrying"
+                    // banner that never resolves, while the user's own manual
+                    // close-and-reconnect (which starts a fresh mosh-server)
+                    // works immediately. Once we have been silent this long,
+                    // have re-bound the socket repeatedly, AND the device does
+                    // have a network, "the network is away" no longer explains
+                    // it: report the transport dead so the session layer can
+                    // reconnect. The connectivity gate is deliberate — with no
+                    // network this never fires, so a phone in a pocket still
+                    // resumes, which is the #92 regression we must not repeat.
+                    if (shouldDeclareDead(recvAge, rebindsSinceReceive, networkAvailable())) {
+                        logger.e(
+                            TAG,
+                            "No packets for ${recvAge}ms across $rebindsSinceReceive rebinds " +
+                                "while the network is up — declaring the session dead (#421)",
+                        )
+                        close()
+                        onDisconnect?.invoke(false)
+                        return
                     }
                 }
 
@@ -402,6 +445,32 @@ class MoshTransport(
         const val STALL_DISPLAY_MS = 8_000L
         /** Cadence of socket rebinds during a stall (IP roaming recovery). */
         const val NETWORK_STALL_MS = 6_000L
+        /**
+         * Silence after which an ONLINE device treats the session as gone
+         * rather than roaming (#421). Generous on purpose: a real roam (Wi-Fi →
+         * LTE, VPN flap) recovers within a rebind or two, so anything past this
+         * with connectivity present is a session the server no longer has.
+         * Never fires while offline — see [networkAvailable] and #92.
+         */
+        const val DEAD_SESSION_MS = 45_000L
+        /** Rebinds that must go unanswered before [DEAD_SESSION_MS] can fire. */
+        const val MIN_REBINDS_BEFORE_DEAD = 3
+
+        /**
+         * Whether a silent session should be given up on (#421). All three
+         * conditions are required, and [networkAvailable] is the one that
+         * matters most: without it this is the #92 heuristic that killed live
+         * sessions whenever the phone went offline briefly. Pure so the policy
+         * is testable without waiting out [DEAD_SESSION_MS] of real time.
+         */
+        fun shouldDeclareDead(
+            recvAgeMs: Long,
+            rebindsSinceReceive: Int,
+            networkAvailable: Boolean,
+        ): Boolean =
+            recvAgeMs > DEAD_SESSION_MS &&
+                rebindsSinceReceive >= MIN_REBINDS_BEFORE_DEAD &&
+                networkAvailable
         /**
          * State number mosh-server sends to announce shutdown after the
          * shell exits (uint64 max, i.e. -1). Upstream mosh
