@@ -129,6 +129,15 @@ class MoshTransport(
             try {
                 connection = MoshConnection(serverIp, port, crypto, socketProvider)
                 logger.d(TAG, "UDP socket connected to $serverIp:$port")
+                // Start the silence clock at connect, not at first packet. The
+                // stall/rebind/escalation block is gated on lastReceiveTimeMs > 0,
+                // so a session that never hears back at all — server gone, port
+                // blocked, wrong host after a move — used to skip it entirely: no
+                // rebinds, no stall age, no escalation, just retransmits forever.
+                // That is the same "stuck retrying" the user reports, in the
+                // never-connected case. Device-verified with mosh-fault-rig.py:
+                // the replacement session sent 50+ retransmits and 0 rebinds.
+                lastReceiveTimeMs = System.currentTimeMillis()
             } catch (e: Exception) {
                 logger.e(TAG, "Failed to create UDP connection", e)
                 onDisconnect?.invoke(false)
