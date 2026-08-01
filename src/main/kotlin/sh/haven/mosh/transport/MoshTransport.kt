@@ -102,6 +102,14 @@ class MoshTransport(
      * gone unanswered, not merely because one rebind landed badly.
      */
     @Volatile private var rebindsSinceReceive: Int = 0
+
+    /**
+     * When the remote state last actually advanced, and how many diffs we have
+     * rejected since. Together these separate "receiving but stuck" (#421) from
+     * "idle": an idle session records no skips.
+     */
+    @Volatile private var lastProgressTimeMs: Long = 0
+    @Volatile private var skipsSinceProgress: Int = 0
     @Volatile private var consecutiveSendErrors: Int = 0
 
     // Stall age surfaced to the UI when the server has gone silent.
@@ -272,8 +280,14 @@ class MoshTransport(
                         "(newNum=${inst.newNum}) — waiting for retransmit with matching base",
                 )
             }
+            // Counted so a sustained run of these can be told apart from an
+            // idle session by the liveness check (#421).
+            skipsSinceProgress++
             return
         }
+
+        lastProgressTimeMs = System.currentTimeMillis()
+        skipsSinceProgress = 0
 
         // Notify the send loop so it can ack the new state promptly.
         // Without this, the send loop sleeps until its next keepalive
@@ -358,7 +372,15 @@ class MoshTransport(
                     // reconnect. The connectivity gate is deliberate — with no
                     // network this never fires, so a phone in a pocket still
                     // resumes, which is the #92 regression we must not repeat.
-                    if (shouldDeclareDead(recvAge, rebindsSinceReceive, networkAvailable())) {
+                    val noProgressAge = if (lastProgressTimeMs == 0L) 0L else now - lastProgressTimeMs
+                    if (shouldDeclareDead(
+                            recvAge,
+                            rebindsSinceReceive,
+                            networkAvailable(),
+                            noProgressAge,
+                            skipsSinceProgress,
+                        )
+                    ) {
                         logger.e(
                             TAG,
                             "No packets for ${recvAge}ms across $rebindsSinceReceive rebinds " +
@@ -419,7 +441,14 @@ class MoshTransport(
             connection?.sendInstruction(instruction) ?: return
             packetsSent++
             val isRetransmit = currentNum == lastSentNewNum && currentNum > serverAckedOurNum
-            if (packetsSent <= 3L || diff.isNotEmpty()) {
+            // Keepalives carry an empty diff, so the first two conditions hide
+            // them entirely after startup. That made a reporter's #421 log
+            // unreadable in the way that mattered: 90 seconds with no sendState
+            // line at all, which looks exactly like a dead send loop but is
+            // equally consistent with healthy keepalives going unlogged. The
+            // sampled third condition makes "we were still sending" visible
+            // without flooding an hour-long offline session.
+            if (packetsSent <= 3L || diff.isNotEmpty() || packetsSent % KEEPALIVE_LOG_EVERY == 0L) {
                 logger.d(TAG, "sendState #$packetsSent: oldNum=$serverAckedOurNum newNum=$currentNum ackNum=$remoteStateNum diffSize=${diff.size}${if (isRetransmit) " RETRANSMIT" else ""}")
             }
             lastSendTimeMs = System.currentTimeMillis()
@@ -476,10 +505,31 @@ class MoshTransport(
             recvAgeMs: Long,
             rebindsSinceReceive: Int,
             networkAvailable: Boolean,
+            noProgressMs: Long = 0L,
+            skipsSinceProgress: Int = 0,
         ): Boolean =
-            recvAgeMs > DEAD_SESSION_MS &&
-                rebindsSinceReceive >= MIN_REBINDS_BEFORE_DEAD &&
-                networkAvailable
+            networkAvailable && (
+                (
+                    recvAgeMs > DEAD_SESSION_MS &&
+                        rebindsSinceReceive >= MIN_REBINDS_BEFORE_DEAD
+                    ) ||
+                    // #421 second failure mode: packets keep ARRIVING but none
+                    // can be used. The server bases every diff on a state we do
+                    // not have, we skip them all, and the silence-based test
+                    // above never fires because the receive stream looks
+                    // perfectly healthy. Observed in a reporter's log: 90
+                    // seconds of nothing but skips, no recovery, no reconnect.
+                    //
+                    // Gated on skips rather than elapsed time alone, because an
+                    // IDLE session also makes no progress — and killing those is
+                    // the #92 regression. A session nobody is using produces no
+                    // skips at all; only a server actively sending diffs we
+                    // cannot apply does.
+                    (
+                        skipsSinceProgress >= MIN_SKIPS_BEFORE_DEAD &&
+                            noProgressMs > NO_PROGRESS_DEAD_MS
+                        )
+                )
         /**
          * State number mosh-server sends to announce shutdown after the
          * shell exits (uint64 max, i.e. -1). Upstream mosh
@@ -488,5 +538,28 @@ class MoshTransport(
         const val SHUTDOWN_STATE_NUM = -1L
         const val KEEPALIVE_INTERVAL_MS = 3000L
         const val RECV_TIMEOUT_MS = 250
+
+        /**
+         * How long a session may keep receiving diffs it cannot apply before
+         * it counts as dead (#421). Shorter than [DEAD_SESSION_MS] because
+         * this state is unambiguous — the peer is talking and we understand
+         * none of it — whereas receive-silence has innocent explanations
+         * (a pocketed phone) that deserve the longer rope.
+         */
+        const val NO_PROGRESS_DEAD_MS = 20_000L
+
+        /**
+         * Skips required before [NO_PROGRESS_DEAD_MS] can fire. A couple of
+         * skips is ordinary: a diff crossing with our ack resolves itself on
+         * the next exchange. A sustained run of them does not.
+         */
+        const val MIN_SKIPS_BEFORE_DEAD = 3
+
+        /**
+         * Log one in this many sends even when nothing changed, so an
+         * otherwise-silent keepalive stream is still visible in a bug report.
+         * At [KEEPALIVE_INTERVAL_MS] that is roughly one line a minute idle.
+         */
+        const val KEEPALIVE_LOG_EVERY = 20L
     }
 }
